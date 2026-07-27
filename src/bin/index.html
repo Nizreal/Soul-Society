@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hogyoku Fragment Sync | Las Noches Network</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary: #9b1c1c;
+            --primary-hover: #7f1d1d;
+            --accent: #c084fc;
+            --bg-color: #0a0012;
+            --surface: rgba(30, 10, 50, 0.75);
+            --text: #f8fafc;
+            --text-muted: #a78bfa;
+            --border: rgba(192, 132, 252, 0.15);
+        }
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Outfit', sans-serif;
+            background: radial-gradient(ellipse at top, #1a0030 0%, #0a0012 60%, #000000 100%);
+            color: var(--text);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .container {
+            width: 100%;
+            max-width: 600px;
+            padding: 2rem;
+        }
+        .glass-card {
+            background: var(--surface);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            padding: 2.5rem;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            transition: transform 0.3s ease;
+        }
+        .glass-card:hover {
+            transform: translateY(-5px);
+        }
+        h1 {
+            margin-top: 0;
+            font-size: 2.5rem;
+            font-weight: 600;
+            background: linear-gradient(to right, #c084fc, #dc2626);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-align: center;
+            margin-bottom: 0.5rem;
+        }
+        p.subtitle {
+            text-align: center;
+            color: var(--text-muted);
+            margin-bottom: 2rem;
+            font-weight: 300;
+        }
+        .input-group {
+            margin-bottom: 1.5rem;
+        }
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            color: var(--text-muted);
+            font-size: 0.9rem;
+        }
+        input {
+            width: 100%;
+            padding: 1rem;
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            color: white;
+            font-family: inherit;
+            font-size: 1rem;
+            box-sizing: border-box;
+            transition: all 0.2s ease;
+        }
+        input:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(192, 132, 252, 0.2);
+        }
+        .btn-group {
+            display: flex;
+            gap: 1rem;
+            margin-top: 2rem;
+        }
+        button {
+            flex: 1;
+            padding: 1rem;
+            border: none;
+            border-radius: 12px;
+            font-family: inherit;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        button.primary {
+            background: linear-gradient(135deg, #7f1d1d, #9b1c1c);
+            color: white;
+            border: 1px solid rgba(220, 38, 38, 0.4);
+        }
+        button.primary:hover {
+            background: var(--primary-hover);
+            transform: translateY(-2px);
+        }
+        button.secondary {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text);
+        }
+        button.secondary:hover {
+            background: rgba(255, 255, 255, 0.05);
+            transform: translateY(-2px);
+        }
+        #result-box {
+            margin-top: 2rem;
+            padding: 1.5rem;
+            border-radius: 12px;
+            background: rgba(0,0,0,0.2);
+            border: 1px solid var(--border);
+            min-height: 24px;
+            text-align: center;
+            font-weight: 300;
+            color: #d8b4fe;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+        .loader {
+            display: none;
+            width: 20px;
+            height: 20px;
+            border: 2px solid rgba(255,255,255,0.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 1s ease-in-out infinite;
+            margin: 0 auto;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="glass-card">
+            <h1>Hogyoku Fragment Sync</h1>
+            <p class="subtitle">Las Noches Distributed Consensus Network</p>
+
+            <div class="input-group">
+                <label for="key">Fragment ID</label>
+                <input type="text" id="key" placeholder="e.g. hogyoku_frag_001" autocomplete="off">
+            </div>
+
+            <div class="input-group">
+                <label for="val">Reiatsu Value</label>
+                <input type="text" id="val" placeholder="e.g. 999999" autocomplete="off">
+            </div>
+
+            <div class="btn-group">
+                <button class="primary" onclick="setValue()">
+                    <span class="btn-text">Sync Fragment</span>
+                    <div class="loader"></div>
+                </button>
+                <button class="secondary" onclick="getValue()">
+                    <span class="btn-text">Read Fragment</span>
+                    <div class="loader"></div>
+                </button>
+            </div>
+
+            <div id="result-box">Awaiting orders from Las Noches...</div>
+        </div>
+    </div>
+
+    <script>
+        const resultBox = document.getElementById('result-box');
+
+        function showResult(text, isError = false) {
+            resultBox.style.opacity = '1';
+            resultBox.style.color = isError ? '#fca5a5' : '#d8b4fe';
+            resultBox.innerText = text;
+        }
+
+        function setLoading(btn, isLoading) {
+            const text = btn.querySelector('.btn-text');
+            const loader = btn.querySelector('.loader');
+            if (isLoading) {
+                text.style.display = 'none';
+                loader.style.display = 'block';
+            } else {
+                text.style.display = 'block';
+                loader.style.display = 'none';
+            }
+        }
+
+        async function getValue() {
+            const key = document.getElementById('key').value;
+            if (!key) return showResult('Please enter a key', true);
+
+            const btn = document.querySelectorAll('button')[1];
+            setLoading(btn, true);
+
+            try {
+                const res = await fetch(`/api/get/${encodeURIComponent(key)}`);
+                const data = await res.json();
+
+                if (data.success) {
+                    showResult(`Value: ${data.data}`);
+                    document.getElementById('val').value = data.data;
+                } else {
+                    showResult(`Error: ${data.error}`, true);
+                }
+            } catch (err) {
+                showResult(`Network Error: ${err.message}`, true);
+            }
+            setLoading(btn, false);
+        }
+
+        async function setValue() {
+            const key = document.getElementById('key').value;
+            const val = document.getElementById('val').value;
+            if (!key || !val) return showResult('Please enter both key and value', true);
+
+            const btn = document.querySelectorAll('button')[0];
+            setLoading(btn, true);
+
+            try {
+                const res = await fetch('/api/set', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ key: key, value: val })
+                });
+                const data = await res.json();
+
+                if (data.success) {
+                    showResult(`Success: ${data.data}`);
+                } else {
+                    showResult(`Error: ${data.error}`, true);
+                }
+            } catch (err) {
+                showResult(`Network Error: ${err.message}`, true);
+            }
+            setLoading(btn, false);
+        }
+    </script>
+</body>
+</html>
