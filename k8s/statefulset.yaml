@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: raft
+  namespace: hogyoku
+spec:
+  serviceName: raft-svc
+  replicas: 3
+  selector:
+    matchLabels:
+      app: raft
+  template:
+    metadata:
+      labels:
+        app: raft
+    spec:
+      serviceAccountName: raft-sa
+      automountServiceAccountToken: false
+      
+      containers:
+        - name: raft
+          image: hogyoku:dev
+          imagePullPolicy: IfNotPresent
+          workingDir: /data
+          ports:
+          - containerPort: 8000
+            name: raft
+          env:
+            - name: PEERS
+              valueFrom:
+                configMapKeyRef:
+                  name: raft-config
+                  key: PEERS
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+              ORDINAL="${POD_NAME##*-}"
+              NODE_ID=$((ORDINAL + 1))
+              ADVERTISE_ADDRESS="${POD_NAME}.raft-svc:8000"
+              CONTACT_NODE_ADDRESS="${CONTACT_NODE_ADDRESS:-raft-1.raft-svc:8000}" # Ini bug belum dibenerin, ga sempet T-T
+              
+              if [ "$ORDINAL" -lt 3 ]; then
+                  exec /app/target/debug/server \
+                    --id "$NODE_ID" \
+                    --advertise-address "$ADVERTISE_ADDRESS" \
+                    --ip 0.0.0.0 \
+                    --port 8000 \
+                    --peers "$PEERS"
+              else
+                  exec /app/target/debug/server \
+                    --id "$NODE_ID" \
+                    --advertise-address "$ADVERTISE_ADDRESS" \
+                    --ip 0.0.0.0 \
+                    --port 8000 \
+                    --peers "" \
+                    --contact-node-address "$CONTACT_NODE_ADDRESS"
+              fi
+          readinessProbe:
+            tcpSocket:
+              port: raft
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          volumeMounts:
+          - name: raft-data
+            mountPath: /data
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - >-
+                    /app/target/debug/client --ip 127.0.0.1 --port 8000
+                    remove-node "$(( ${POD_NAME##*-} + 1 ))"
+
+  volumeClaimTemplates:
+    - metadata:
+        name: raft-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

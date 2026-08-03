@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: raft-svc
+  namespace: hogyoku
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+
+  selector:
+    app: raft
+
+  ports:
+    - name: raft
+      protocol: TCP
+      port: 8000
+      targetPort: 8000

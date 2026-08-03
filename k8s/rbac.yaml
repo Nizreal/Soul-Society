@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: raft-sa
+  namespace: hogyoku
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gateway-sa
+  namespace: hogyoku
+automountServiceAccountToken: false
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: workload-no-api-access
+  namespace: hogyoku
+rules: []
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: workload-no-api-access
+  namespace: hogyoku
+subjects:
+  - kind: ServiceAccount
+    name: raft-sa
+    namespace: hogyoku
+  - kind: ServiceAccount
+    name: gateway-sa
+    namespace: hogyoku
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: workload-no-api-access

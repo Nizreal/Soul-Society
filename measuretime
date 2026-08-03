@@ -1,0 +1,36 @@
+LEADER=raft-1
+NS=hogyoku
+
+CID=$(kubectl get pod "$LEADER" -n "$NS" -o jsonpath='{.status.containerStatuses[0].containerID}' | sed 's#docker://##')
+T0=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
+START=$(date +%s%3N)
+
+echo "Killing leader $LEADER..."
+minikube ssh "sudo docker kill --signal=KILL $CID" >/dev/null
+
+RESULT=""
+for i in $(seq 1 100); do
+  RESULT=$(kubectl logs -n "$NS" -l app=raft --prefix --since-time="$T0" --tail=500 2>/dev/null | grep -Ei 'won election|becoming leader|became leader|elected as leader' | tail -n1)
+
+  [ -n "$RESULT" ] && break
+  sleep 0.1
+done
+
+END=$(date +%s%3N)
+
+if [ -n "$RESULT" ]; then
+  ELAPSED=$(awk "BEGIN {printf \"%.3f\", ($END-$START)/1000}")
+  echo "$RESULT"
+  echo "Leader recovery: $ELAPSED seconds"
+
+  awk "BEGIN {
+    if ($ELAPSED < 10)
+      print \"PASS: leader recovered in under 10 seconds\";
+    else
+      print \"FAIL: leader recovery took 10 seconds or more\";
+  }"
+else
+  echo "FAIL: no new leader detected within 10 seconds"
+fi
+
+kubectl get pod "$LEADER" -n "$NS" -o jsonpath='Killed container restart count: {.status.containerStatuses[0].restartCount}{"\n"}'

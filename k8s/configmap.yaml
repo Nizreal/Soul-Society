@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: raft-config
+  namespace: hogyoku
+data:
+  PEERS: "1=raft-0.raft-svc:8000,2=raft-1.raft-svc:8000,3=raft-2.raft-svc:8000"
+  RAFT_ADDR: "raft-svc:8000"

@@ -1,0 +1,7 @@
+KILL1=raft-0
+KILL2=raft-2
+
+CID1=$(kubectl get pod "$KILL1" -n "$NS" -o jsonpath='{.status.containerStatuses[0].containerID}' | sed 's#docker://##')
+CID2=$(kubectl get pod "$KILL2" -n "$NS" -o jsonpath='{.status.containerStatuses[0].containerID}' | sed 's#docker://##')
+minikube ssh "sudo docker kill --signal=KILL $CID1 $CID2"
+kubectl get pods
