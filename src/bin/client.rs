@@ -1,13 +1,7 @@
 use clap::{Parser, Subcommand};
-use std::net::SocketAddr;
-use tarpc::context;
-use raft_core::{
-    utils::client,
-    domain::Command,
-    rpc::RaftServiceClient,
-    error::NodeError, 
-};
+use raft_core::{domain::Command, error::NodeError, rpc::RaftServiceClient, utils::client};
 use rustyline::{error::ReadlineError, DefaultEditor};
+use tarpc::context;
 
 // Struktur untuk parsing argumen CLI
 #[derive(Parser)]
@@ -29,13 +23,27 @@ struct Cli {
 #[derive(Subcommand)]
 enum Action {
     Ping,
-    Get { key: String },
-    Set { key: String, value: String },
-    Append { key: String, value: String },
-    Del { key: String },
-    Strlen { key: String },
+    Get {
+        key: String,
+    },
+    Set {
+        key: String,
+        value: String,
+    },
+    Append {
+        key: String,
+        value: String,
+    },
+    Del {
+        key: String,
+    },
+    Strlen {
+        key: String,
+    },
     Log,
-    RemoveNode { node_id: u64 },
+    RemoveNode {
+        node_id: u64,
+    },
     /// Start interactive mode (shell-like)
     Interactive,
 }
@@ -44,19 +52,21 @@ enum Action {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let initial_addr: SocketAddr = format!("{}:{}", cli.ip, cli.port).parse()?;
+    let initial_addr = format!("{}:{}", cli.ip, cli.port);
     const MAX_RETRIES: u32 = 3;
 
     match &cli.command {
         Action::Log => {
             // Log doesn't need redirection, as any node can provide its log.
             println!("Connecting to server on {}...", initial_addr);
-            let transport = tarpc::serde_transport::tcp::connect(initial_addr, tarpc::tokio_serde::formats::Json::default).await?;
-            let client = RaftServiceClient::new(tarpc::client::Config::default(), transport).spawn();
+            let client = client::connect(&initial_addr).await?;
             let logs = client.request_log(context::current()).await?;
             println!("--- LOG SERVER ---");
             for entry in logs {
-                println!("Term: {}, Index: {}, Cmd: {:?}", entry.term, entry.index, entry.command);
+                println!(
+                    "Term: {}, Index: {}, Cmd: {:?}",
+                    entry.term, entry.index, entry.command
+                );
             }
         }
         Action::RemoveNode { node_id } => {
@@ -64,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
             let rpc_call = |client: RaftServiceClient| async move {
                 client.remove_membership(context::current(), *node_id).await
             };
-            
+
             match client::execute_with_redirect(initial_addr, MAX_RETRIES, rpc_call).await {
                 Ok(_) => println!("Successfully requested removal of node {}.", node_id),
                 Err(e) => eprintln!("Error: {}", e),
@@ -83,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
                         if input.is_empty() {
                             continue;
                         }
-                        
+
                         let _ = rl.add_history_entry(input);
 
                         match input {
@@ -120,7 +130,9 @@ async fn main() -> anyhow::Result<()> {
                             "ping" => cmd_payload = Some(Command::Ping),
                             "get" => {
                                 if parts.len() == 2 {
-                                    cmd_payload = Some(Command::Get { key: parts[1].to_string() });
+                                    cmd_payload = Some(Command::Get {
+                                        key: parts[1].to_string(),
+                                    });
                                 } else {
                                     eprintln!("Usage: get <key>");
                                 }
@@ -145,14 +157,18 @@ async fn main() -> anyhow::Result<()> {
                             }
                             "del" => {
                                 if parts.len() == 2 {
-                                    cmd_payload = Some(Command::Del { key: parts[1].to_string() });
+                                    cmd_payload = Some(Command::Del {
+                                        key: parts[1].to_string(),
+                                    });
                                 } else {
                                     eprintln!("Usage: del <key>");
                                 }
                             }
                             "strlen" => {
                                 if parts.len() == 2 {
-                                    cmd_payload = Some(Command::Strlen { key: parts[1].to_string() });
+                                    cmd_payload = Some(Command::Strlen {
+                                        key: parts[1].to_string(),
+                                    });
                                 } else {
                                     eprintln!("Usage: strlen <key>");
                                 }
@@ -160,20 +176,21 @@ async fn main() -> anyhow::Result<()> {
                             "log" => {
                                 _is_special_cmd = true;
                                 println!("Connecting to server on {}...", current_server_addr);
-                                let transport_result = tarpc::serde_transport::tcp::connect(current_server_addr, tarpc::tokio_serde::formats::Json::default).await;
-                                match transport_result {
-                                    Ok(transport) => {
-                                        let client = RaftServiceClient::new(tarpc::client::Config::default(), transport).spawn();
+                                match client::connect(&current_server_addr).await {
+                                    Ok(client) => {
                                         match client.request_log(context::current()).await {
                                             Ok(logs) => {
                                                 println!("--- LOG SERVER ---");
                                                 for entry in logs {
-                                                    println!("Term: {}, Index: {}, Cmd: {:?}", entry.term, entry.index, entry.command);
+                                                    println!(
+                                                        "Term: {}, Index: {}, Cmd: {:?}",
+                                                        entry.term, entry.index, entry.command
+                                                    );
                                                 }
-                                            },
+                                            }
                                             Err(e) => eprintln!("Error requesting logs: {}", e),
                                         }
-                                    },
+                                    }
                                     Err(e) => eprintln!("Failed to connect: {}", e),
                                 }
                             }
@@ -181,13 +198,27 @@ async fn main() -> anyhow::Result<()> {
                                 _is_special_cmd = true;
                                 if parts.len() == 2 {
                                     if let Ok(node_id) = parts[1].parse::<u64>() {
-                                        println!("Attempting to remove node {} from the cluster...", node_id);
+                                        println!(
+                                            "Attempting to remove node {} from the cluster...",
+                                            node_id
+                                        );
                                         let rpc_call = |client: RaftServiceClient| async move {
-                                            client.remove_membership(context::current(), node_id).await
+                                            client
+                                                .remove_membership(context::current(), node_id)
+                                                .await
                                         };
-                                        
-                                        match client::execute_with_redirect(current_server_addr, MAX_RETRIES, rpc_call).await {
-                                            Ok(_) => println!("Successfully requested removal of node {}.", node_id),
+
+                                        match client::execute_with_redirect(
+                                            current_server_addr.clone(),
+                                            MAX_RETRIES,
+                                            rpc_call,
+                                        )
+                                        .await
+                                        {
+                                            Ok(_) => println!(
+                                                "Successfully requested removal of node {}.",
+                                                node_id
+                                            ),
                                             Err(e) => eprintln!("Error: {}", e),
                                         }
                                     } else {
@@ -203,38 +234,41 @@ async fn main() -> anyhow::Result<()> {
                         if let Some(payload) = cmd_payload {
                             let rpc_call = |client: RaftServiceClient| {
                                 let payload_clone = payload.clone();
-                                async move {
-                                    client.execute(context::current(), payload_clone).await
-                                }
+                                async move { client.execute(context::current(), payload_clone).await }
                             };
 
-                            match client::execute_with_redirect(current_server_addr, MAX_RETRIES, rpc_call).await {
+                            match client::execute_with_redirect(
+                                current_server_addr.clone(),
+                                MAX_RETRIES,
+                                rpc_call,
+                            )
+                            .await
+                            {
                                 Ok(response) => println!("Response: {}", response),
                                 Err(e) => {
                                     eprintln!("Error: {}", e);
                                     // Handle redirection manually for interactive mode cache update
                                     if let Some(node_error) = e.downcast_ref::<NodeError>() {
-                                        if let NodeError::NotLeader { leader_addr } = node_error {
-                                            if let Some(addr_str) = leader_addr {
-                                                if let Ok(new_addr) = addr_str.parse::<SocketAddr>() {
-                                                    current_server_addr = new_addr;
-                                                    println!("Redirected to leader at {}. Retrying next command there.", current_server_addr);
-                                                }
-                                            }
+                                        if let NodeError::NotLeader {
+                                            leader_addr: Some(addr_str),
+                                        } = node_error
+                                        {
+                                            current_server_addr = addr_str.clone();
+                                            println!("Redirected to leader at {}. Retrying next command there.", current_server_addr);
                                         }
                                     }
                                 }
                             }
                         }
-                    },
+                    }
                     Err(ReadlineError::Interrupted) => {
                         println!("CTRL-C");
                         break;
-                    },
+                    }
                     Err(ReadlineError::Eof) => {
                         println!("CTRL-D");
                         break;
-                    },
+                    }
                     Err(err) => {
                         println!("Error: {:?}", err);
                         break;
@@ -246,9 +280,15 @@ async fn main() -> anyhow::Result<()> {
             // All other commands use the standard `execute` RPC.
             let cmd_payload = match &cli.command {
                 Action::Ping => Command::Ping,
-                Action::Set { key, value } => Command::Set { key: key.clone(), value: value.clone() },
+                Action::Set { key, value } => Command::Set {
+                    key: key.clone(),
+                    value: value.clone(),
+                },
                 Action::Get { key } => Command::Get { key: key.clone() },
-                Action::Append { key, value } => Command::Append { key: key.clone(), value: value.clone() },
+                Action::Append { key, value } => Command::Append {
+                    key: key.clone(),
+                    value: value.clone(),
+                },
                 Action::Del { key } => Command::Del { key: key.clone() },
                 Action::Strlen { key } => Command::Strlen { key: key.clone() },
                 _ => unreachable!(), // Log, RemoveNode, and Interactive are handled above
@@ -257,9 +297,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Executing command: {:?}", cmd_payload);
             let rpc_call = |client: RaftServiceClient| {
                 let cmd_payload = cmd_payload.clone();
-                async move {
-                    client.execute(context::current(), cmd_payload).await
-                }
+                async move { client.execute(context::current(), cmd_payload).await }
             };
 
             match client::execute_with_redirect(initial_addr, MAX_RETRIES, rpc_call).await {
@@ -271,4 +309,3 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
-

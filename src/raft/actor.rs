@@ -1,22 +1,23 @@
-use rand::{Rng, rng};
+use rand::{rng, Rng};
 use tarpc::context;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::spawn_blocking;
-use tokio::time::{Interval, MissedTickBehavior, interval};
-use tracing::{debug, info, warn, error};
+use tokio::time::{interval, Instant, MissedTickBehavior, Sleep};
+use tracing::{debug, error, info, warn};
 
-use crate::utils::client::execute_with_redirect;
 use crate::domain::{Command, LogEntry, Role, Snapshot};
 use crate::error::NodeError;
-use crate::rpc::{AppendEntriesReply, ApplyMembershipResponse, RequestVoteReply, RaftServiceClient, InstallSnapshotReply};
+use crate::rpc::{
+    AppendEntriesReply, ApplyMembershipResponse, InstallSnapshotReply, RaftServiceClient,
+    RequestVoteReply,
+};
+use crate::utils::client::execute_with_redirect;
 
 use super::state::RaftState;
-use std::cmp::min;
-use std::time::Duration;
-use std::collections::{HashMap, BTreeMap};
-use std::net::SocketAddr;
 use crate::raft::machine::StateMachine;
-use tarpc::{client, tokio_serde::formats::Json};
+use std::cmp::min;
+use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
 
 // consts for time (in ms)
 const ELECTION_TIMEOUT_MIN: u64 = 1500;
@@ -26,12 +27,12 @@ const RAFT_LOG_SIZE_LIMIT: u64 = 10;
 
 // Pesan yang bisa dikirim ke Actor
 pub enum ActorMsg {
-    ClientRequest { 
-        cmd: Command, 
-        reply_to: oneshot::Sender<Result<String, NodeError>> 
+    ClientRequest {
+        cmd: Command,
+        reply_to: oneshot::Sender<Result<String, NodeError>>,
     },
     RequestLog {
-        reply_to: oneshot::Sender<Vec<LogEntry>>
+        reply_to: oneshot::Sender<Vec<LogEntry>>,
     },
     // Membership Change Message
     ApplyMembership {
@@ -43,7 +44,7 @@ pub enum ActorMsg {
         node_id: u64,
         reply_to: oneshot::Sender<Result<(), NodeError>>,
     },
-    UpdatePeerClient { 
+    UpdatePeerClient {
         node_id: u64,
         client: RaftServiceClient,
     },
@@ -51,12 +52,12 @@ pub enum ActorMsg {
         peer_id: u64,
     },
     // Pesan Internal Raft (RPC masuk di-convert jadi pesan ini)
-    RequestVote { 
+    RequestVote {
         term: u64,
         candidate_id: u64,
         last_log_index: u64,
         last_log_term: u64,
-        reply_to: oneshot::Sender<RequestVoteReply>
+        reply_to: oneshot::Sender<RequestVoteReply>,
     },
     AppendEntries {
         term: u64,
@@ -65,26 +66,31 @@ pub enum ActorMsg {
         prev_log_term: u64,
         entries: Vec<LogEntry>,
         leader_commit: u64,
-        reply_to: oneshot::Sender<AppendEntriesReply>
+        reply_to: oneshot::Sender<AppendEntriesReply>,
     },
     AppendEntriesResult {
         peer_id: u64,
         term: u64,
         success: bool,
-        last_log_index: u64, 
+        last_log_index: u64,
+    },
+    VoteResult {
+        peer_id: u64,
+        election_term: u64,
+        reply: RequestVoteReply,
     },
     InstallSnapshot {
         term: u64,
         leader_id: u64,
-        last_included_index : u64,
+        last_included_index: u64,
         last_included_term: u64,
         data: Vec<u8>,
         done: bool,
-        reply_to: oneshot::Sender<InstallSnapshotReply>
+        reply_to: oneshot::Sender<InstallSnapshotReply>,
     },
     InstallSnapshotReply {
         term: u64,
-        success: bool
+        success: bool,
     },
     TriggerSnapshot,
 }
@@ -97,11 +103,15 @@ pub struct RaftActor {
     state_machine: StateMachine,
     // Mapping: Log Index -> Channel untuk balas ke Client
     pending_requests: BTreeMap<u64, oneshot::Sender<Result<String, NodeError>>>,
+    pending_membership: BTreeMap<u64, oneshot::Sender<Result<ApplyMembershipResponse, NodeError>>>,
+    pending_removals: BTreeMap<u64, oneshot::Sender<Result<(), NodeError>>>,
+    election_votes: u64,
+    election_term: Option<u64>,
 }
 
 impl RaftActor {
     pub fn new(
-        state: RaftState, 
+        mut state: RaftState,
         inbox: mpsc::Receiver<ActorMsg>,
         msg_sender: mpsc::Sender<ActorMsg>,
         peers: HashMap<u64, RaftServiceClient>,
@@ -111,16 +121,53 @@ impl RaftActor {
 
         if let Ok(content) = std::fs::read_to_string(&snapshot_path) {
             if let Ok(snapshot) = serde_json::from_str::<Snapshot>(&content) {
-                info!("Loaded snapshot from {} (last_included_index={})", snapshot_path, snapshot.last_included_index);
+                info!(
+                    "Loaded snapshot from {} (last_included_index={})",
+                    snapshot_path, snapshot.last_included_index
+                );
                 state_machine.data = snapshot.data;
             } else {
                 warn!("Failed to deserialize snapshot from {}", snapshot_path);
             }
         } else {
-            info!("No snapshot found at {}, starting with empty state machine.", snapshot_path);
+            info!(
+                "No snapshot found at {}, starting with empty state machine.",
+                snapshot_path
+            );
         }
 
-        Self { state, inbox, msg_sender, peers, state_machine, pending_requests: BTreeMap::new() }
+        // Rebuild state exactly through the persisted commit point.  Snapshot
+        // data is the base and committed entries after it must be replayed.
+        let replay_from = state.last_included_index + 1;
+        for index in replay_from..=state.commit_index {
+            let physical = (index - state.last_included_index) as usize;
+            if let Some(entry) = state.log.get(physical) {
+                match &entry.command {
+                    Command::AddNode { id, address } if *id != state.my_id => {
+                        state.peers.insert(*id, address.clone());
+                    }
+                    Command::RemoveNode { id } => {
+                        state.peers.remove(id);
+                    }
+                    command => {
+                        state_machine.apply(command);
+                    }
+                }
+            }
+        }
+        state.last_applied = state.commit_index;
+        Self {
+            state,
+            inbox,
+            msg_sender,
+            peers,
+            state_machine,
+            pending_requests: BTreeMap::new(),
+            pending_membership: BTreeMap::new(),
+            pending_removals: BTreeMap::new(),
+            election_votes: 0,
+            election_term: None,
+        }
     }
 
     fn random_election_timeout() -> Duration {
@@ -132,18 +179,26 @@ impl RaftActor {
         let hs = self.state.get_hs();
         let id = self.state.my_id;
 
-        spawn_blocking(move || {
-            RaftState::save_hs_to_disk(hs, id)
-        })
-        .await
-        .map_err(|e| NodeError::Internal(format!("Join error: {}", e)))??;
+        spawn_blocking(move || RaftState::save_hs_to_disk(hs, id))
+            .await
+            .map_err(|e| NodeError::Internal(format!("Join error: {}", e)))??;
 
         Ok(())
     }
 
+    fn update_readiness(&self) {
+        if self.state.role == Role::Leader || self.state.current_leader.is_some() {
+            if let Err(error) = std::fs::write("raft.ready", b"ready\n") {
+                warn!("cannot update readiness: {error}");
+            }
+        } else {
+            let _ = std::fs::remove_file("raft.ready");
+        }
+    }
+
     pub async fn run(mut self) {
-        let mut election_timer = interval(Self::random_election_timeout());
-        election_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let election_timer = tokio::time::sleep(Self::random_election_timeout());
+        tokio::pin!(election_timer);
         let mut heartbeat_timer = interval(Duration::from_millis(HEARTBEAT_INTERVAL));
         heartbeat_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -157,14 +212,12 @@ impl RaftActor {
                 }
 
                 // 2. Election Timeout (Jika Follower/Candidate)
-                _ = election_timer.tick() => {
+                _ = &mut election_timer => {
                     if self.state.role != Role::Leader {
                         warn!("Election timeout reached! Starting election...");
                         self.start_election().await;
 
-                        election_timer = interval(Self::random_election_timeout());
-                        election_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                        election_timer.reset();
+                        election_timer.as_mut().reset(Instant::now() + Self::random_election_timeout());
                     }
                 }
 
@@ -182,7 +235,7 @@ impl RaftActor {
     async fn handle_message(
         &mut self,
         msg: ActorMsg,
-        election_timer: &mut Interval
+        election_timer: &mut std::pin::Pin<&mut Sleep>,
     ) {
         match msg {
             ActorMsg::ClientRequest { cmd, reply_to } => {
@@ -191,8 +244,13 @@ impl RaftActor {
             ActorMsg::RequestLog { reply_to } => {
                 let _ = reply_to.send(self.state.log.clone());
             }
-            ActorMsg::ApplyMembership { node_id, node_addr, reply_to } => {
-                self.handle_apply_membership(node_id, node_addr, reply_to).await;
+            ActorMsg::ApplyMembership {
+                node_id,
+                node_addr,
+                reply_to,
+            } => {
+                self.handle_apply_membership(node_id, node_addr, reply_to)
+                    .await;
             }
             ActorMsg::RemoveMembership { node_id, reply_to } => {
                 self.handle_remove_membership(node_id, reply_to).await;
@@ -206,18 +264,59 @@ impl RaftActor {
                     warn!("Removed dead client for peer {}", peer_id);
                 }
             }
-            ActorMsg::RequestVote { term, candidate_id, last_log_index, last_log_term, reply_to } => {
-                self.handle_request_vote(term, candidate_id, last_log_index, last_log_term, reply_to, election_timer).await;
+            ActorMsg::RequestVote {
+                term,
+                candidate_id,
+                last_log_index,
+                last_log_term,
+                reply_to,
+            } => {
+                self.handle_request_vote(
+                    term,
+                    candidate_id,
+                    last_log_index,
+                    last_log_term,
+                    reply_to,
+                    election_timer,
+                )
+                .await;
             }
-            ActorMsg::AppendEntries { term, leader_id, prev_log_index, prev_log_term, entries, leader_commit, reply_to } => {
-                self.handle_append_entries(term, leader_id, prev_log_index, prev_log_term, entries, leader_commit, reply_to, election_timer).await;
+            ActorMsg::AppendEntries {
+                term,
+                leader_id,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+                reply_to,
+            } => {
+                self.handle_append_entries(
+                    term,
+                    leader_id,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                    leader_commit,
+                    reply_to,
+                    election_timer,
+                )
+                .await;
             }
-            ActorMsg::AppendEntriesResult { peer_id, term, success, last_log_index } => {
+            ActorMsg::AppendEntriesResult {
+                peer_id,
+                term,
+                success,
+                last_log_index,
+            } => {
+                // Result belongs to a former leader/candidate period.
+                if self.state.role != Role::Leader || term != self.state.current_term {
+                    return;
+                }
                 if term > self.state.current_term {
                     self.state.become_follower(term);
                     return;
                 }
-                
+
                 if success {
                     self.state.update_match_index(peer_id, last_log_index);
                     self.state.update_next_index(peer_id, last_log_index + 1);
@@ -227,12 +326,41 @@ impl RaftActor {
                     }
                 } else {
                     let current_next = *self.state.next_index.get(&peer_id).unwrap_or(&1);
-                    let new_next = if current_next > 1 { current_next - 1 } else { 1 };
+                    let new_next = if current_next > 1 {
+                        current_next - 1
+                    } else {
+                        1
+                    };
                     self.state.update_next_index(peer_id, new_next);
                 }
             }
-            ActorMsg::InstallSnapshot { term, leader_id, last_included_index, last_included_term, data, done, reply_to } => {
-                self.handle_install_snapshot(term, leader_id, last_included_index, last_included_term, data, done, reply_to, election_timer).await;
+            ActorMsg::VoteResult {
+                peer_id,
+                election_term,
+                reply,
+            } => {
+                self.handle_vote_result(peer_id, election_term, reply).await;
+            }
+            ActorMsg::InstallSnapshot {
+                term,
+                leader_id,
+                last_included_index,
+                last_included_term,
+                data,
+                done,
+                reply_to,
+            } => {
+                self.handle_install_snapshot(
+                    term,
+                    leader_id,
+                    last_included_index,
+                    last_included_term,
+                    data,
+                    done,
+                    reply_to,
+                    election_timer,
+                )
+                .await;
             }
             ActorMsg::InstallSnapshotReply { .. } => {
                 // Currently handled via direct async call in send_heartbeats logic or could be expanded.
@@ -245,7 +373,7 @@ impl RaftActor {
 
     async fn handle_trigger_snapshot(&mut self) {
         let last_applied = self.state.last_applied;
-        
+
         // Cannot snapshot if applied index hasn't moved past existing snapshot
         if last_applied <= self.state.last_included_index {
             return;
@@ -255,14 +383,14 @@ impl RaftActor {
 
         // 1. Capture State Machine
         let snapshot_data = self.state_machine.data.clone();
-        
+
         // 2. Get last included term
         let last_term = self.state.get_log_term(last_applied);
 
         let snapshot = Snapshot {
             last_included_index: last_applied,
             last_included_term: last_term,
-            data: snapshot_data
+            data: snapshot_data,
         };
 
         // 3. Save to disk
@@ -274,36 +402,46 @@ impl RaftActor {
             std::fs::write(&tmp_path, json).map_err(|e| e.to_string())?;
             std::fs::rename(&tmp_path, &path).map_err(|e| e.to_string())?;
             Ok::<(), String>(())
-        }).await;
+        })
+        .await;
 
         if let Ok(Ok(())) = save_result {
             info!("Snapshot saved successfully.");
-            
+
             // 4. Truncate Log in Memory
             // We need to keep the entry at last_applied as the new dummy entry (index 0)
             // Calculate how many to remove from front.
             // Current log: [last_included_index, ..., last_applied, ...]
             // New log: [last_applied, ...]
-            
+
             let remove_count = (last_applied - self.state.last_included_index) as usize;
-            
+
             // Safety check
             if remove_count < self.state.log.len() {
                 self.state.log.drain(0..remove_count);
                 // The new first element is now at `last_applied`
-                self.state.log[0].term = last_term; 
+                self.state.log[0].term = last_term;
                 self.state.log[0].index = last_applied;
                 self.state.log[0].command = Command::Ping; // Dummy command
-                
+
                 self.state.last_included_index = last_applied;
                 self.state.last_included_term = last_term;
-                
-                let _ = self.persist_state().await;
-                info!("Log truncated. New start index: {}", self.state.last_included_index);
-            } else {
-                error!("Log truncation error: remove_count {} >= log.len {}", remove_count, self.state.log.len());
-            }
 
+                if let Err(error) = self.persist_state().await {
+                    error!("snapshot hard-state persistence failed: {error}");
+                } else {
+                    info!(
+                        "Log truncated. New start index: {}",
+                        self.state.last_included_index
+                    );
+                }
+            } else {
+                error!(
+                    "Log truncation error: remove_count {} >= log.len {}",
+                    remove_count,
+                    self.state.log.len()
+                );
+            }
         } else {
             error!("Failed to save snapshot to disk.");
         }
@@ -318,48 +456,82 @@ impl RaftActor {
         data: Vec<u8>,
         _done: bool, // Assuming full snapshot for now
         reply_to: oneshot::Sender<InstallSnapshotReply>,
-        election_timer: &mut Interval,
+        election_timer: &mut std::pin::Pin<&mut Sleep>,
     ) {
         if term < self.state.current_term {
-            let _ = reply_to.send(InstallSnapshotReply { term: self.state.current_term, success: false });
+            let _ = reply_to.send(InstallSnapshotReply {
+                term: self.state.current_term,
+                success: false,
+            });
             return;
         }
 
         if term > self.state.current_term || self.state.role != Role::Leader {
             self.state.become_follower(term);
         }
-        
+
         self.state.current_leader = Some(leader_id);
-        election_timer.reset();
+        self.update_readiness();
+        election_timer
+            .as_mut()
+            .reset(Instant::now() + Self::random_election_timeout());
 
         // Decode Snapshot
         if let Ok(snapshot) = serde_json::from_slice::<Snapshot>(&data) {
-             info!("Installing snapshot up to index {}", last_included_index);
-             
-             // Update State Machine
-             self.state_machine.data = snapshot.data;
+            info!("Installing snapshot up to index {}", last_included_index);
+            let snapshot_path = format!("snapshot_{}.json", self.state.my_id);
+            let temp_path = format!("{}.tmp", snapshot_path);
+            if let Err(error) = std::fs::write(&temp_path, &data)
+                .and_then(|_| std::fs::rename(&temp_path, &snapshot_path))
+            {
+                error!("refusing installed snapshot because it cannot be saved: {error}");
+                let _ = reply_to.send(InstallSnapshotReply {
+                    term: self.state.current_term,
+                    success: false,
+                });
+                return;
+            }
 
-             // Update Log (Truncate)
-             // Discard entire log and reset from snapshot
-             
-             self.state.last_included_index = last_included_index;
-             self.state.last_included_term = last_included_term;
-             self.state.commit_index = last_included_index;
-             self.state.last_applied = last_included_index;
+            // Update State Machine
+            self.state_machine.data = snapshot.data;
 
-             // Create a new dummy entry at the snapshot index
-             let dummy_entry = LogEntry {
-                 term: last_included_term,
-                 index: last_included_index,
-                 command: Command::Ping // Placeholder
-             };
-             self.state.log = vec![dummy_entry];
+            // Update Log (Truncate)
+            // Discard entire log and reset from snapshot
 
-             let _ = self.persist_state().await;
-             let _ = reply_to.send(InstallSnapshotReply { term: self.state.current_term, success: true });
+            self.state.last_included_index = last_included_index;
+            self.state.last_included_term = last_included_term;
+            self.state.commit_index = last_included_index;
+            self.state.last_applied = last_included_index;
+
+            // Create a new dummy entry at the snapshot index
+            let dummy_entry = LogEntry {
+                term: last_included_term,
+                index: last_included_index,
+                command: Command::Ping, // Placeholder
+            };
+            self.state.log = vec![dummy_entry];
+
+            match self.persist_state().await {
+                Ok(()) => {
+                    let _ = reply_to.send(InstallSnapshotReply {
+                        term: self.state.current_term,
+                        success: true,
+                    });
+                }
+                Err(error) => {
+                    error!("refusing installed snapshot success: {error}");
+                    let _ = reply_to.send(InstallSnapshotReply {
+                        term: self.state.current_term,
+                        success: false,
+                    });
+                }
+            }
         } else {
             warn!("Failed to deserialize snapshot data");
-            let _ = reply_to.send(InstallSnapshotReply { term: self.state.current_term, success: false });
+            let _ = reply_to.send(InstallSnapshotReply {
+                term: self.state.current_term,
+                success: false,
+            });
         }
     }
     async fn handle_request_vote(
@@ -369,33 +541,54 @@ impl RaftActor {
         last_log_index: u64,
         last_log_term: u64,
         reply_to: oneshot::Sender<RequestVoteReply>,
-        election_timer: &mut Interval,
+        election_timer: &mut std::pin::Pin<&mut Sleep>,
     ) {
         if term > self.state.current_term {
-            info!("Received RequestVote with higher term ({}), updating term.", term);
+            info!(
+                "Received RequestVote with higher term ({}), updating term.",
+                term
+            );
             self.state.become_follower(term);
         }
 
         let mut vote_granted = false;
 
         if term >= self.state.current_term {
-            let can_vote = self.state.voted_for.is_none() || self.state.voted_for == Some(candidate_id);
+            let can_vote =
+                self.state.voted_for.is_none() || self.state.voted_for == Some(candidate_id);
             let is_log_ok = self.state.is_log_up_to_date(last_log_index, last_log_term);
 
             if can_vote && is_log_ok {
                 vote_granted = true;
                 self.state.voted_for = Some(candidate_id);
-                election_timer.reset();
-                info!("Vote GRANTED for candidate {} at term {}", candidate_id, term);
+                election_timer
+                    .as_mut()
+                    .reset(Instant::now() + Self::random_election_timeout());
+                info!(
+                    "Vote GRANTED for candidate {} at term {}",
+                    candidate_id, term
+                );
             } else {
-                debug!("Vote DENIED for candidate {}. Reason: voted_for={:?}, log_ok={}", candidate_id, self.state.voted_for, is_log_ok);
+                debug!(
+                    "Vote DENIED for candidate {}. Reason: voted_for={:?}, log_ok={}",
+                    candidate_id, self.state.voted_for, is_log_ok
+                );
             }
         } else {
-            debug!("Vote DENIED for candidate {}. Reason: Term too old ({} < {})", candidate_id, term, self.state.current_term);
+            debug!(
+                "Vote DENIED for candidate {}. Reason: Term too old ({} < {})",
+                candidate_id, term, self.state.current_term
+            );
         }
 
-        let _ = self.persist_state().await;
-        let _ = reply_to.send(RequestVoteReply { term: self.state.current_term, vote_granted });
+        if let Err(error) = self.persist_state().await {
+            error!("refusing vote because persistence failed: {error}");
+            vote_granted = false;
+        }
+        let _ = reply_to.send(RequestVoteReply {
+            term: self.state.current_term,
+            vote_granted,
+        });
     }
 
     async fn handle_append_entries(
@@ -407,24 +600,47 @@ impl RaftActor {
         entries: Vec<LogEntry>,
         leader_commit: u64,
         reply_to: oneshot::Sender<AppendEntriesReply>,
-        election_timer: &mut Interval
+        election_timer: &mut std::pin::Pin<&mut Sleep>,
     ) {
         if term < self.state.current_term {
-            debug!("Rejecting AppendEntries from {} (Term {} < {})", leader_id, term, self.state.current_term);
-            let _ = reply_to.send(AppendEntriesReply { term: self.state.current_term, success: false });
+            debug!(
+                "Rejecting AppendEntries from {} (Term {} < {})",
+                leader_id, term, self.state.current_term
+            );
+            let _ = reply_to.send(AppendEntriesReply {
+                term: self.state.current_term,
+                success: false,
+            });
             return;
         }
 
         if term > self.state.current_term || self.state.role != Role::Follower {
-            info!("Recognized valid Leader {} at term {}. Becoming Follower.", leader_id, term);
+            info!(
+                "Recognized valid Leader {} at term {}. Becoming Follower.",
+                leader_id, term
+            );
             self.state.become_follower(term);
         }
 
         self.state.current_leader = Some(leader_id);
-        election_timer.reset();
+        self.update_readiness();
+        election_timer
+            .as_mut()
+            .reset(Instant::now() + Self::random_election_timeout());
 
-        let success = self.state.append_entries(prev_log_index, prev_log_term, entries);
-        let _ = self.persist_state().await;
+        let success = self
+            .state
+            .append_entries(prev_log_index, prev_log_term, entries);
+        if success {
+            if let Err(error) = self.persist_state().await {
+                error!("refusing AppendEntries success because persistence failed: {error}");
+                let _ = reply_to.send(AppendEntriesReply {
+                    term: self.state.current_term,
+                    success: false,
+                });
+                return;
+            }
+        }
 
         if success {
             if leader_commit > self.state.commit_index {
@@ -434,14 +650,17 @@ impl RaftActor {
                 debug!("Commit index updated to {}", self.state.commit_index);
             }
         }
-        let _ = reply_to.send(AppendEntriesReply { term: self.state.current_term, success });
+        let _ = reply_to.send(AppendEntriesReply {
+            term: self.state.current_term,
+            success,
+        });
     }
 
     async fn apply_committed_entries(&mut self) {
         while self.state.last_applied < self.state.commit_index {
             self.state.last_applied += 1;
             let idx = self.state.last_applied;
-            
+
             // Adjust index for log access
             let log_len = self.state.log.len();
             // Virtual index -> Physical index
@@ -453,8 +672,34 @@ impl RaftActor {
 
             if physical_idx < log_len {
                 let entry = &self.state.log[physical_idx];
-                let result = self.state_machine.apply(&entry.command);
-                info!("Applied log index {}: {:?} -> {}", idx, entry.command, result);
+                let result = match &entry.command {
+                    Command::AddNode { id, address } => {
+                        if *id != self.state.my_id {
+                            self.state.peers.insert(*id, address.clone());
+                        }
+                        if let Some(reply) = self.pending_membership.remove(&idx) {
+                            let mut peers = self.state.peers.clone();
+                            peers.insert(self.state.my_id, self.state.my_addr.clone());
+                            let _ = reply.send(Ok(ApplyMembershipResponse { peers }));
+                        }
+                        "OK".into()
+                    }
+                    Command::RemoveNode { id } => {
+                        self.state.peers.remove(id);
+                        self.peers.remove(id);
+                        self.state.next_index.remove(id);
+                        self.state.match_index.remove(id);
+                        if let Some(reply) = self.pending_removals.remove(&idx) {
+                            let _ = reply.send(Ok(()));
+                        }
+                        "OK".into()
+                    }
+                    command => self.state_machine.apply(command),
+                };
+                info!(
+                    "Applied log index {}: {:?} -> {}",
+                    idx, entry.command, result
+                );
 
                 if let Some(sender) = self.pending_requests.remove(&idx) {
                     let _ = sender.send(Ok(result));
@@ -472,8 +717,19 @@ impl RaftActor {
 
     /* Internal Logic */
     async fn start_election(&mut self) {
-        self.state.become_candidate(); 
-        let _ = self.persist_state().await; 
+        self.state.become_candidate();
+        self.state.current_leader = None;
+        self.update_readiness();
+        self.fail_pending(NodeError::NotLeader { leader_addr: None });
+        if let Err(error) = self.persist_state().await {
+            error!("cannot start election without persisting term: {error}");
+            self.state.role = Role::Follower;
+            return;
+        }
+
+        if let Err(error) = self.persist_state().await {
+            error!("failed to persist committed index: {error}");
+        }
 
         let term = self.state.current_term;
         let my_id = self.state.my_id;
@@ -481,51 +737,89 @@ impl RaftActor {
         let last_log_term = self.state.last_log_term();
         info!("Election started for Term {}", term);
 
-        let (tx, mut rx): (mpsc::Sender<(u64, RequestVoteReply)>, mpsc::Receiver<(u64, RequestVoteReply)>) = mpsc::channel(self.peers.len().max(1)); 
-
         for (peer_id, client) in &self.peers {
             let client = client.clone();
-            let tx_inner = tx.clone();
+            let sender = self.msg_sender.clone();
             let peer_id = *peer_id;
-            
+
             tokio::spawn(async move {
                 let mut context = tarpc::context::current();
                 context.deadline = std::time::Instant::now() + Duration::from_millis(1000);
-                let reply = client.request_vote(context, term, my_id, last_log_index, last_log_term).await;
-                
+                let reply = client
+                    .request_vote(context, term, my_id, last_log_index, last_log_term)
+                    .await;
+
                 if let Ok(response) = reply {
-                    let _ = tx_inner.send((peer_id, response)).await;
+                    let _ = sender
+                        .send(ActorMsg::VoteResult {
+                            peer_id,
+                            election_term: term,
+                            reply: response,
+                        })
+                        .await;
                 } else {
                     warn!("Peer {} failed to vote", peer_id);
                 }
             });
         }
-        drop(tx); 
+        self.election_term = Some(term);
+        self.election_votes = 1;
+        if self.election_votes >= self.majority() {
+            self.become_leader().await;
+        }
+    }
 
-        let mut votes_received = 1;
-        let majority = (self.state.peers.len() + 1) / 2 + 1;
+    fn majority(&self) -> u64 {
+        (self.state.peers.len() as u64 + 1) / 2 + 1
+    }
 
-        while let Some((peer_id, reply)) = rx.recv().await {
-            if reply.term > term {
-                warn!("Peer {} has higher term ({}). Stepping down.", peer_id, reply.term);
-                self.state.become_follower(reply.term);
-                let _ = self.persist_state().await;
-                return;
+    async fn handle_vote_result(
+        &mut self,
+        peer_id: u64,
+        election_term: u64,
+        reply: RequestVoteReply,
+    ) {
+        if self.state.role != Role::Candidate || self.election_term != Some(election_term) {
+            return;
+        }
+        if reply.term > self.state.current_term {
+            self.state.become_follower(reply.term);
+            self.state.current_leader = None;
+            self.update_readiness();
+            self.election_term = None;
+            if let Err(error) = self.persist_state().await {
+                error!("failed to persist newer term: {error}");
             }
-
-            if reply.vote_granted { 
-                votes_received += 1;
-                info!("Vote received from {}. Total: {}", peer_id, votes_received);
-            };
-
-            if votes_received >= majority {
-                info!("Won election with {} votes! Becoming LEADER for Term {}", votes_received, term);
-                self.state.become_leader();
-                self.send_heartbeats().await;
-                return;
+        } else if reply.vote_granted {
+            self.election_votes += 1;
+            info!(
+                "Vote received from {}. Total: {}",
+                peer_id, self.election_votes
+            );
+            if self.election_votes >= self.majority() {
+                self.become_leader().await;
             }
         }
-        info!("Election finished without majority.");
+    }
+
+    async fn become_leader(&mut self) {
+        self.state.become_leader();
+        self.update_readiness();
+        self.election_term = None;
+        info!("Became leader for term {}", self.state.current_term);
+        self.send_heartbeats().await;
+    }
+
+    fn fail_pending(&mut self, error: NodeError) {
+        for (_, sender) in std::mem::take(&mut self.pending_requests) {
+            let _ = sender.send(Err(error.clone()));
+        }
+        for (_, sender) in std::mem::take(&mut self.pending_membership) {
+            let _ = sender.send(Err(error.clone()));
+        }
+        for (_, sender) in std::mem::take(&mut self.pending_removals) {
+            let _ = sender.send(Err(error.clone()));
+        }
     }
 
     async fn send_heartbeats(&mut self) {
@@ -541,7 +835,7 @@ impl RaftActor {
             let my_id = self.state.my_id;
             let leader_commit = self.state.commit_index;
             let next_index = *self.state.next_index.get(&peer_id).unwrap_or(&1);
-            
+
             // Check if we need to send a snapshot
             if next_index <= self.state.last_included_index {
                 // Send Snapshot
@@ -553,20 +847,23 @@ impl RaftActor {
                 tokio::spawn(async move {
                     let client = match existing_client {
                         Some(c) => c,
-                        None => {
-                             if let Ok(addr) = peer_addr_str.parse::<SocketAddr>() {
-                                match tokio::time::timeout(Duration::from_millis(HEARTBEAT_INTERVAL), tarpc::serde_transport::tcp::connect(addr, Json::default)).await {
-                                    Ok(Ok(transport)) => {
-                                        let new_client = RaftServiceClient::new(client::Config::default(), transport).spawn();
-                                        let _ = sender.send(ActorMsg::UpdatePeerClient { node_id: peer_id, client: new_client.clone() }).await;
-                                        new_client
-                                    }
-                                    _ => return,
-                                }
-                            } else {
-                                return;
+                        None => match tokio::time::timeout(
+                            Duration::from_millis(HEARTBEAT_INTERVAL),
+                            crate::utils::client::connect(&peer_addr_str),
+                        )
+                        .await
+                        {
+                            Ok(Ok(new_client)) => {
+                                let _ = sender
+                                    .send(ActorMsg::UpdatePeerClient {
+                                        node_id: peer_id,
+                                        client: new_client.clone(),
+                                    })
+                                    .await;
+                                new_client
                             }
-                        }
+                            _ => return,
+                        },
                     };
 
                     // Read snapshot from disk
@@ -581,30 +878,42 @@ impl RaftActor {
                     let mut context = tarpc::context::current();
                     context.deadline = std::time::Instant::now() + Duration::from_millis(2000); // Longer timeout for snapshot
 
-                    match client.install_snapshot(context, term, my_id, last_included_index, last_included_term, data, true).await {
+                    match client
+                        .install_snapshot(
+                            context,
+                            term,
+                            my_id,
+                            last_included_index,
+                            last_included_term,
+                            data,
+                            true,
+                        )
+                        .await
+                    {
                         Ok(reply) => {
-                             // Treat success like AppendEntries success: update indices
-                             // We re-use AppendEntriesResult for simplicity to update state
-                             let _ = sender.send(ActorMsg::AppendEntriesResult {
-                                peer_id,
-                                term: reply.term,
-                                success: reply.success,
-                                last_log_index: last_included_index, 
-                            }).await;
+                            // Treat success like AppendEntries success: update indices
+                            // We re-use AppendEntriesResult for simplicity to update state
+                            let _ = sender
+                                .send(ActorMsg::AppendEntriesResult {
+                                    peer_id,
+                                    term: reply.term,
+                                    success: reply.success,
+                                    last_log_index: last_included_index,
+                                })
+                                .await;
                         }
                         Err(e) => {
-                             warn!("InstallSnapshot RPC failed for peer {}: {}", peer_id, e);
-                             let _ = sender.send(ActorMsg::PeerDisconnected { peer_id }).await;
+                            warn!("InstallSnapshot RPC failed for peer {}: {}", peer_id, e);
+                            let _ = sender.send(ActorMsg::PeerDisconnected { peer_id }).await;
                         }
                     }
                 });
-
             } else {
                 // Send AppendEntries (Existing Logic)
                 let prev_log_index = next_index - 1;
                 // Use virtual indexing helper
                 let prev_log_term = self.state.get_log_term(prev_log_index);
-                
+
                 // Get entries: adjust for virtual indexing
                 let entries = if next_index <= self.state.last_log_index() {
                     // Calculate start index in the physical log vector
@@ -626,39 +935,68 @@ impl RaftActor {
                         Some(c) => c,
                         None => {
                             info!("[Heartbeat] Peer {} disconnected, attempting to reconnect to {}...", peer_id, peer_addr_str);
-                            if let Ok(addr) = peer_addr_str.parse::<SocketAddr>() {
-                                match tokio::time::timeout(Duration::from_millis(HEARTBEAT_INTERVAL), tarpc::serde_transport::tcp::connect(addr, Json::default)).await {
-                                    Ok(Ok(transport)) => {
-                                        let new_client = RaftServiceClient::new(client::Config::default(), transport).spawn();
-                                        info!("[Heartbeat] Successfully reconnected to peer {}", peer_id);
-                                        let _ = sender.send(ActorMsg::UpdatePeerClient { node_id: peer_id, client: new_client.clone() }).await;
+                            {
+                                match tokio::time::timeout(
+                                    Duration::from_millis(HEARTBEAT_INTERVAL),
+                                    crate::utils::client::connect(&peer_addr_str),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(new_client)) => {
+                                        info!(
+                                            "[Heartbeat] Successfully reconnected to peer {}",
+                                            peer_id
+                                        );
+                                        let _ = sender
+                                            .send(ActorMsg::UpdatePeerClient {
+                                                node_id: peer_id,
+                                                client: new_client.clone(),
+                                            })
+                                            .await;
                                         new_client
                                     }
                                     _ => {
-                                        debug!("[Heartbeat] Failed to reconnect to peer {}", peer_id);
+                                        debug!(
+                                            "[Heartbeat] Failed to reconnect to peer {}",
+                                            peer_id
+                                        );
                                         return;
                                     }
                                 }
-                            } else {
-                                return;
                             }
                         }
                     };
-                    
+
                     let mut context = tarpc::context::current();
                     context.deadline = std::time::Instant::now() + Duration::from_millis(1000);
 
-                    match client.append_entries(context, term, my_id, prev_log_index, prev_log_term, entries, leader_commit).await {
+                    match client
+                        .append_entries(
+                            context,
+                            term,
+                            my_id,
+                            prev_log_index,
+                            prev_log_term,
+                            entries,
+                            leader_commit,
+                        )
+                        .await
+                    {
                         Ok(resp) => {
-                             let _ = sender.send(ActorMsg::AppendEntriesResult {
-                                peer_id,
-                                term: resp.term,
-                                success: resp.success,
-                                last_log_index: last_idx_sent,
-                            }).await;
+                            let _ = sender
+                                .send(ActorMsg::AppendEntriesResult {
+                                    peer_id,
+                                    term: resp.term,
+                                    success: resp.success,
+                                    last_log_index: last_idx_sent,
+                                })
+                                .await;
                         }
                         Err(_) => {
-                            warn!("[Heartbeat] RPC failed for peer {}. Marking disconnected.", peer_id);
+                            warn!(
+                                "[Heartbeat] RPC failed for peer {}. Marking disconnected.",
+                                peer_id
+                            );
                             let _ = sender.send(ActorMsg::PeerDisconnected { peer_id }).await;
                         }
                     }
@@ -667,7 +1005,11 @@ impl RaftActor {
         }
     }
 
-    async fn handle_client_request(&mut self, cmd: Command, reply_to: oneshot::Sender<Result<String, NodeError>>) {
+    async fn handle_client_request(
+        &mut self,
+        cmd: Command,
+        reply_to: oneshot::Sender<Result<String, NodeError>>,
+    ) {
         if self.state.role != Role::Leader {
             let leader_id = self.state.current_leader;
             let leader_addr = leader_id.and_then(|id| self.state.peers.get(&id).cloned());
@@ -677,12 +1019,22 @@ impl RaftActor {
 
         let new_index = self.state.last_log_index() + 1;
         let term = self.state.current_term;
-        let entry = LogEntry { term, index: new_index, command: cmd };
+        let entry = LogEntry {
+            term,
+            index: new_index,
+            command: cmd,
+        };
         self.state.log.push(entry);
         self.pending_requests.insert(new_index, reply_to);
 
         info!("Leader appended command to log index {}", new_index);
-        let _ = self.persist_state().await;
+        if let Err(error) = self.persist_state().await {
+            let _ = self
+                .pending_requests
+                .remove(&new_index)
+                .map(|sender| sender.send(Err(error)));
+            return;
+        }
         self.send_heartbeats().await;
 
         // Try to advance commit index immediately (important for single-node clusters)
@@ -717,62 +1069,29 @@ impl RaftActor {
             let _ = reply_to.send(Ok(response));
             return;
         }
-    
+
         info!("Adding new node {} at {} to cluster", node_id, node_addr);
-        self.state.peers.insert(node_id, node_addr.clone());
-        self.state.next_index.insert(node_id, self.state.last_log_index() + 1);
-        self.state.match_index.insert(node_id, 0);
-    
         let new_index = self.state.last_log_index() + 1;
         let entry = LogEntry {
             term: self.state.current_term,
             index: new_index,
-            command: Command::AddNode { id: node_id, address: node_addr.clone() },
+            command: Command::AddNode {
+                id: node_id,
+                address: node_addr.clone(),
+            },
         };
         self.state.log.push(entry);
-    
-        let _ = self.persist_state().await;
-
-        let node_addr_parsed: SocketAddr = match node_addr.parse() {
-            Ok(a) => a,
-            Err(_) => {
-                let _ = reply_to.send(Err(NodeError::Internal("Invalid Address".into())));
-                return;
-            }
-        };
-        
-        match tarpc::serde_transport::tcp::connect(node_addr_parsed, Json::default).await {
-            Ok(transport) => {
-                let client = RaftServiceClient::new(client::Config::default(), transport).spawn();
-                self.peers.insert(node_id, client);
-                info!("Connected to new peer {}", node_id);
-            }
-            Err(e) => {
-                warn!("Failed to connect to new peer {}: {}", node_id, e);
-                let msg_sender = self.msg_sender.clone();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        if let Ok(transport) = tarpc::serde_transport::tcp::connect(node_addr_parsed, Json::default).await {
-                            let client = RaftServiceClient::new(client::Config::default(), transport).spawn();
-                            let _ = msg_sender.send(ActorMsg::UpdatePeerClient { node_id, client }).await;
-                            break;
-                        }
-                    }
-                });
-            }
+        if let Err(error) = self.persist_state().await {
+            let _ = reply_to.send(Err(error));
+            return;
         }
-    
+        // The new node participates in replication before the entry is
+        // committed, but membership becomes authoritative only when applied.
+        self.state.peers.insert(node_id, node_addr);
+        self.state.next_index.insert(node_id, new_index);
+        self.state.match_index.insert(node_id, 0);
+        self.pending_membership.insert(new_index, reply_to);
         self.send_heartbeats().await;
-        
-        // Re-create the complete list to include the new node and the leader.
-        let mut final_peers = self.state.peers.clone();
-        final_peers.insert(self.state.my_id, self.state.my_addr.clone());
-        
-        let response = ApplyMembershipResponse {
-            peers: final_peers,
-        };
-        let _ = reply_to.send(Ok(response));
     }
 
     async fn handle_remove_membership(
@@ -787,17 +1106,14 @@ impl RaftActor {
             return;
         }
 
-        if !self.state.peers.contains_key(&node_id) {
+        // A leader does not keep itself in `peers`, but a terminating leader
+        // still needs to replicate its own RemoveNode entry before exiting.
+        if node_id != self.state.my_id && !self.state.peers.contains_key(&node_id) {
             let _ = reply_to.send(Err(NodeError::Internal("Node not found".into())));
             return;
         }
 
         info!("Removing node {} from cluster", node_id);
-        self.state.peers.remove(&node_id);
-        self.state.next_index.remove(&node_id);
-        self.state.match_index.remove(&node_id);
-        self.peers.remove(&node_id);
-
         let new_index = self.state.last_log_index() + 1;
         let entry = LogEntry {
             term: self.state.current_term,
@@ -805,13 +1121,15 @@ impl RaftActor {
             command: Command::RemoveNode { id: node_id },
         };
         self.state.log.push(entry);
-        let _ = self.persist_state().await;
+        if let Err(error) = self.persist_state().await {
+            let _ = reply_to.send(Err(error));
+            return;
+        }
+        self.pending_removals.insert(new_index, reply_to);
         self.send_heartbeats().await;
-        let _ = reply_to.send(Ok(()));
     }
 
     pub async fn bootstrap(&mut self, contact_node_address: String) -> anyhow::Result<()> {
-        let initial_addr: SocketAddr = contact_node_address.parse()?;
         const MAX_RETRIES: u32 = 3;
 
         let my_id = self.state.my_id;
@@ -820,14 +1138,18 @@ impl RaftActor {
         let rpc_call = |client: RaftServiceClient| {
             let my_addr_str = my_addr_str.clone();
             async move {
-                client.apply_membership(context::current(), my_id, my_addr_str).await
+                client
+                    .apply_membership(context::current(), my_id, my_addr_str)
+                    .await
             }
         };
 
-        match execute_with_redirect(initial_addr, MAX_RETRIES, rpc_call).await {
+        match execute_with_redirect(contact_node_address, MAX_RETRIES, rpc_call).await {
             Ok(join_response) => {
                 info!("Successfully joined the cluster. Updating peer list.");
                 self.state.peers = join_response.peers;
+                self.state.peers.remove(&self.state.my_id);
+                self.persist_state().await?;
                 info!("Updated peer list from leader: {:?}", self.state.peers);
                 Ok(())
             }

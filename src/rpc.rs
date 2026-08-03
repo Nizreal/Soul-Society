@@ -13,17 +13,20 @@ pub trait RaftService {
     async fn request_log() -> Vec<LogEntry>;
 
     // --- Membership RPC ---
-    async fn apply_membership(node_id: u64, node_addr: String) -> Result<ApplyMembershipResponse, NodeError>;
+    async fn apply_membership(
+        node_id: u64,
+        node_addr: String,
+    ) -> Result<ApplyMembershipResponse, NodeError>;
     async fn remove_membership(node_id: u64) -> Result<(), NodeError>;
 
     // --- Raft Internal RPCs ---
-    
+
     // Vote Request (Election)
     async fn request_vote(
         term: u64,
         candidate_id: u64,
         last_log_index: u64,
-        last_log_term: u64
+        last_log_term: u64,
     ) -> RequestVoteReply;
 
     // Heartbeat & Replication
@@ -33,16 +36,16 @@ pub trait RaftService {
         prev_log_index: u64,
         prev_log_term: u64,
         entries: Vec<LogEntry>,
-        leader_commit: u64
+        leader_commit: u64,
     ) -> AppendEntriesReply;
 
     async fn install_snapshot(
         term: u64,
         leader_id: u64,
-        last_included_index : u64,
+        last_included_index: u64,
         last_included_term: u64,
         data: Vec<u8>,
-        done: bool
+        done: bool,
     ) -> InstallSnapshotReply;
 }
 
@@ -67,5 +70,5 @@ pub struct ApplyMembershipResponse {
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct InstallSnapshotReply {
     pub term: u64,
-    pub success: bool
+    pub success: bool,
 }

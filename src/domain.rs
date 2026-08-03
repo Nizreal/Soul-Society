@@ -37,8 +37,8 @@ pub enum Role {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct Snapshot{
+pub struct Snapshot {
     pub last_included_index: u64,
     pub last_included_term: u64,
-    pub data: HashMap<String, String>
+    pub data: HashMap<String, String>,
 }

@@ -2,8 +2,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{from_str, to_string_pretty};
 use tracing::{debug, info};
 
-use crate::{domain::{LogEntry, Role, Command}, error::NodeError}; 
-use std::{collections::HashMap, fs::{read_to_string, rename, write}, path::Path};
+use crate::{
+    domain::{Command, LogEntry, Role},
+    error::NodeError,
+};
+use std::{
+    collections::HashMap,
+    fs::{read_to_string, rename, write},
+    path::Path,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardState {
@@ -12,6 +19,10 @@ pub struct HardState {
     log: Vec<LogEntry>,
     last_included_index: u64,
     last_included_term: u64,
+    #[serde(default)]
+    commit_index: u64,
+    #[serde(default)]
+    peers: HashMap<u64, String>,
 }
 
 pub struct RaftState {
@@ -29,7 +40,7 @@ pub struct RaftState {
     // Leader Only
     pub next_index: HashMap<u64, u64>,
     pub match_index: HashMap<u64, u64>,
-    
+
     // Membership
     pub my_addr: String,
     pub peers: HashMap<u64, String>, // ID -> Address
@@ -42,10 +53,17 @@ pub struct RaftState {
 
 impl RaftState {
     pub fn new(id: u64, peers: HashMap<u64, String>) -> Self {
+        Self::new_with_addr(id, peers, format!("127.0.0.1:{}", 8000 + id))
+    }
+
+    pub fn new_with_addr(id: u64, mut peers: HashMap<u64, String>, my_addr: String) -> Self {
+        // A node is never its own peer. Keeping this invariant makes quorum and
+        // replication bookkeeping independent of how membership was configured.
+        peers.remove(&id);
         let storage_path = format!("node_{}.json", id);
         if let Ok(hs) = Self::load_hs(&storage_path) {
             info!("Loaded persistent state from {}", storage_path);
-            return Self::restore(id, peers, hs);
+            return Self::restore(id, peers, my_addr, hs);
         }
 
         // dummy entry at index 0 (matches last_included_index=0)
@@ -68,12 +86,12 @@ impl RaftState {
             match_index: HashMap::new(),
             peers,
             my_id: id,
-            my_addr: format!("127.0.0.1:{}", 8000 + id),
+            my_addr,
             last_included_index: 0,
             last_included_term: 0,
         }
     }
-    
+
     // --- Log Access Helpers (Virtual Indexing) ---
 
     pub fn last_log_index(&self) -> u64 {
@@ -81,7 +99,10 @@ impl RaftState {
     }
 
     pub fn last_log_term(&self) -> u64 {
-        self.log.last().map(|e| e.term).unwrap_or(self.last_included_term) 
+        self.log
+            .last()
+            .map(|e| e.term)
+            .unwrap_or(self.last_included_term)
     }
 
     /// Safely gets the term of a log entry at a specific logical index.
@@ -107,7 +128,7 @@ impl RaftState {
         &mut self,
         prev_log_index: u64,
         prev_log_term: u64,
-        entries: Vec<LogEntry>
+        entries: Vec<LogEntry>,
     ) -> bool {
         // 1. Safety Check: If request is for an index we've already compacted, we can't verify it.
         // The Leader should have sent InstallSnapshot instead.
@@ -148,15 +169,11 @@ impl RaftState {
             }
             index += 1;
         }
-        
+
         true
     }
 
-    pub fn is_log_up_to_date(
-        &self,
-        last_log_index: u64,
-        last_log_term: u64
-    ) -> bool {
+    pub fn is_log_up_to_date(&self, last_log_index: u64, last_log_term: u64) -> bool {
         let my_last_term = self.last_log_term();
         let my_last_index = self.last_log_index();
 
@@ -246,12 +263,14 @@ impl RaftState {
         let json = to_string_pretty(&hs)
             .map_err(|e| NodeError::Internal(format!("Serialize error: {}", e)))?;
 
-        write(&tmp_path, json)
-            .map_err(|e| NodeError::Internal(format!("Write error: {}", e)))?;
+        write(&tmp_path, json).map_err(|e| NodeError::Internal(format!("Write error: {}", e)))?;
         rename(&tmp_path, &path)
             .map_err(|e| NodeError::Internal(format!("Rename error: {}", e)))?;
-        
-        debug!("Persisted hard state to disk (term={}, last_idx={})", hs.current_term, hs.last_included_index);
+
+        debug!(
+            "Persisted hard state to disk (term={}, last_idx={})",
+            hs.current_term, hs.last_included_index
+        );
         Ok(())
     }
 
@@ -259,27 +278,35 @@ impl RaftState {
         if !Path::new(path).exists() {
             return Err(NodeError::Internal("File not found".into()));
         }
-        let content = read_to_string(path)
-            .map_err(|e| NodeError::Internal(format!("Read error: {}", e)))?;
-        from_str(&content)
-            .map_err(|e| NodeError::Internal(format!("Deserialize error: {}", e)))
+        let content =
+            read_to_string(path).map_err(|e| NodeError::Internal(format!("Read error: {}", e)))?;
+        from_str(&content).map_err(|e| NodeError::Internal(format!("Deserialize error: {}", e)))
     }
 
     fn restore(
         id: u64,
-        peers: HashMap<u64, String>,
-        hs: HardState
+        configured_peers: HashMap<u64, String>,
+        my_addr: String,
+        hs: HardState,
     ) -> Self {
+        // A committed membership supersedes the ConfigMap. Older state files
+        // have an empty `peers` field and fall back to configured peers.
+        let mut peers = if hs.peers.is_empty() {
+            configured_peers
+        } else {
+            hs.peers.clone()
+        };
+        peers.remove(&id);
         // If we have a snapshot, log[0] is the snapshot placeholder
         let dummy_entry = LogEntry {
             term: hs.last_included_term,
             index: hs.last_included_index,
-            command: Command::Ping, 
+            command: Command::Ping,
         };
 
         // If log on disk is empty (which technically shouldn't happen if properly persisted with dummy),
         // we recreate the dummy.
-        let log = if hs.log.is_empty() { 
+        let log = if hs.log.is_empty() {
             vec![dummy_entry]
         } else {
             hs.log
@@ -289,7 +316,7 @@ impl RaftState {
             current_term: hs.current_term,
             voted_for: hs.voted_for,
             log,
-            commit_index: hs.last_included_index, // Commit index starts at least at snapshot
+            commit_index: hs.commit_index.max(hs.last_included_index),
             last_applied: hs.last_included_index, // Last applied also starts at snapshot
             current_leader: None,
             role: Role::Follower,
@@ -297,19 +324,21 @@ impl RaftState {
             match_index: HashMap::new(),
             peers,
             my_id: id,
-            my_addr: format!("127.0.0.1:{}", 8000 + id),
+            my_addr,
             last_included_index: hs.last_included_index,
             last_included_term: hs.last_included_term,
         }
     }
 
     pub fn get_hs(&self) -> HardState {
-        HardState { 
+        HardState {
             current_term: self.current_term,
-            voted_for: self.voted_for, 
+            voted_for: self.voted_for,
             log: self.log.clone(),
             last_included_index: self.last_included_index,
             last_included_term: self.last_included_term,
+            commit_index: self.commit_index,
+            peers: self.peers.clone(),
         }
     }
 }

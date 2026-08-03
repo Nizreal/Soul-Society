@@ -3,7 +3,7 @@ use std::io;
 use std::net::AddrParseError;
 use tarpc::client::RpcError;
 
-#[derive(Debug, Serialize, Deserialize, thiserror::Error)]
+#[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
 pub enum NodeError {
     #[error("Not the leader. Leader is at {leader_addr:?}")]
     NotLeader {

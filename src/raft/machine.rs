@@ -1,6 +1,6 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::info;
-use serde::{Serialize, Deserialize};
 
 use crate::domain::Command;
 
@@ -26,16 +26,16 @@ impl StateMachine {
                 "OK".to_string()
             }
 
-            Command::Get { key } => {
-                self.data.get(key).cloned().unwrap_or_else(|| "".to_string())
-            }
+            Command::Get { key } => self
+                .data
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| "".to_string()),
 
-            Command::Strlen { key } => {
-                match self.data.get(key) {
-                    Some(val) => val.len().to_string(),
-                    None => "0".to_string(),
-                }
-            }
+            Command::Strlen { key } => match self.data.get(key) {
+                Some(val) => val.len().to_string(),
+                None => "0".to_string(),
+            },
 
             Command::Append { key, value } => {
                 self.data
@@ -45,17 +45,18 @@ impl StateMachine {
                 "OK".to_string()
             }
 
-            Command::Del { key } => {
-                match self.data.remove(key) {
-                    Some(val) => val,
-                    None => "".to_string(),
-                }
-            }
+            Command::Del { key } => match self.data.remove(key) {
+                Some(val) => val,
+                None => "".to_string(),
+            },
 
             // Membership changes ditangani di layer Raft, bukan di KV Store,
             // tapi kita bisa return OK saja.
             Command::AddNode { id, address } => {
-                info!("Membership change applied: Added node {} at {}", id, address);
+                info!(
+                    "Membership change applied: Added node {} at {}",
+                    id, address
+                );
                 "OK".to_string()
             }
             Command::RemoveNode { id } => {

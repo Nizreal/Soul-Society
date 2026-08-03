@@ -1,5 +1,5 @@
-use raft_core::raft::state::RaftState;
 use raft_core::domain::{Command, LogEntry};
+use raft_core::raft::state::RaftState;
 use std::collections::HashMap;
 use std::fs;
 
@@ -12,17 +12,33 @@ fn create_test_state(id: u64) -> RaftState {
     cleanup(id);
     let peers = HashMap::new();
     let mut state = RaftState::new(id, peers);
-    
+
     // Setup initial state:
     // last_included_index = 5, term = 1
     // log has entries 6, 7, 8 with term 2
     state.last_included_index = 5;
     state.last_included_term = 1;
     state.log = vec![
-        LogEntry { term: 1, index: 5, command: Command::Ping }, // Dummy at snapshot index
-        LogEntry { term: 2, index: 6, command: Command::Ping },
-        LogEntry { term: 2, index: 7, command: Command::Ping },
-        LogEntry { term: 2, index: 8, command: Command::Ping },
+        LogEntry {
+            term: 1,
+            index: 5,
+            command: Command::Ping,
+        }, // Dummy at snapshot index
+        LogEntry {
+            term: 2,
+            index: 6,
+            command: Command::Ping,
+        },
+        LogEntry {
+            term: 2,
+            index: 7,
+            command: Command::Ping,
+        },
+        LogEntry {
+            term: 2,
+            index: 8,
+            command: Command::Ping,
+        },
     ];
     state
 }
@@ -62,18 +78,22 @@ fn test_append_entries_conflict_and_overlap() {
 
     // Scenario A: Stale Append (Old Index)
     // Leader tries to append starting at index 4 (which is compacted)
-    let entries = vec![
-        LogEntry { term: 1, index: 5, command: Command::Ping }
-    ];
+    let entries = vec![LogEntry {
+        term: 1,
+        index: 5,
+        command: Command::Ping,
+    }];
     // append_entries(prev_log_index=4, prev_log_term=1, ...)
     // Should fail because prev_log_index (4) < last_included_index (5)
     assert_eq!(state.append_entries(4, 1, entries.clone()), false);
 
     // Scenario B: Valid Append (Extension)
     // Append index 9(t2)
-    let new_entries = vec![
-        LogEntry { term: 2, index: 9, command: Command::Ping }
-    ];
+    let new_entries = vec![LogEntry {
+        term: 2,
+        index: 9,
+        command: Command::Ping,
+    }];
     // prev_log_index=8, term=2
     assert_eq!(state.append_entries(8, 2, new_entries), true);
     assert_eq!(state.last_log_index(), 9);
@@ -82,12 +102,20 @@ fn test_append_entries_conflict_and_overlap() {
     // Scenario C: Conflict (Truncation)
     // Append index 7(t3) -> Should replace 7(t2), 8(t2), 9(t2)
     let conflict_entries = vec![
-        LogEntry { term: 3, index: 7, command: Command::Ping },
-        LogEntry { term: 3, index: 8, command: Command::Ping }
+        LogEntry {
+            term: 3,
+            index: 7,
+            command: Command::Ping,
+        },
+        LogEntry {
+            term: 3,
+            index: 8,
+            command: Command::Ping,
+        },
     ];
     // prev_log_index=6, term=2 (matches)
     assert_eq!(state.append_entries(6, 2, conflict_entries), true);
-    
+
     // Verify log state
     assert_eq!(state.last_log_index(), 8);
     assert_eq!(state.get_log_term(7), 3);
@@ -108,7 +136,7 @@ fn test_virtual_indexing_helper() {
     // Physical index 3 -> Logical index 8
 
     assert_eq!(state.last_log_index(), 8);
-    
+
     // Check if `log` vector access logic is consistent manually
     assert_eq!(state.log[0].index, 5);
     assert_eq!(state.log[3].index, 8);

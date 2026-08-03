@@ -1,20 +1,20 @@
 use std::net::SocketAddr;
 
 use clap::Parser;
+use futures::StreamExt;
 use raft_core::domain::{Command, LogEntry};
 use raft_core::error::NodeError;
-use raft_core::rpc::{AppendEntriesReply, ApplyMembershipResponse, RaftService, RequestVoteReply, InstallSnapshotReply};
-use futures::StreamExt;
+use raft_core::raft::actor::{ActorMsg, RaftActor};
+use raft_core::raft::state::RaftState;
+use raft_core::rpc::{
+    AppendEntriesReply, ApplyMembershipResponse, InstallSnapshotReply, RaftService,
+    RequestVoteReply,
+};
+use std::time::Duration;
 use tarpc::server::{self, Channel};
 use tarpc::{context, tokio_serde::formats::Json};
 use tokio::sync::{mpsc, oneshot};
-use raft_core::raft::actor::{RaftActor, ActorMsg};
-use raft_core::raft::state::RaftState;
-use std::time::Duration;
 use tracing_subscriber::EnvFilter;
-
-use tarpc::client;
-use raft_core::rpc::RaftServiceClient;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -28,56 +28,52 @@ struct Args {
     peers: String,
     #[arg(long)]
     contact_node_address: Option<String>,
+    #[arg(long)]
+    advertise_address: String,
 }
 
 #[derive(Clone, Debug)]
 struct RaftNodeHandle {
-    tx: mpsc::Sender<ActorMsg>
+    tx: mpsc::Sender<ActorMsg>,
 }
 
 impl RaftService for RaftNodeHandle {
-    async fn execute(
-        self, 
-        _: context::Context, 
-        cmd: Command
-    ) -> Result<String, NodeError> {
+    async fn execute(self, _: context::Context, cmd: Command) -> Result<String, NodeError> {
         let (reply_to, rx) = oneshot::channel();
 
-        let msg = ActorMsg::ClientRequest { 
-            cmd, 
-            reply_to 
-        };
+        let msg = ActorMsg::ClientRequest { cmd, reply_to };
 
         if self.tx.send(msg).await.is_err() {
             return Err(NodeError::Internal("Actor is dead".into()));
         }
 
-        rx.await.map_err(|_| NodeError::Internal("Actor did not reply".into()))?
+        rx.await
+            .map_err(|_| NodeError::Internal("Actor did not reply".into()))?
     }
 
     async fn request_vote(
-        self, 
+        self,
         _: context::Context,
         term: u64,
         candidate_id: u64,
         last_log_index: u64,
-        last_log_term: u64
+        last_log_term: u64,
     ) -> RequestVoteReply {
         let (reply_to, rx) = oneshot::channel();
 
-        let msg = ActorMsg::RequestVote { 
-            term, 
-            candidate_id, 
-            last_log_index, 
-            last_log_term, 
-            reply_to 
+        let msg = ActorMsg::RequestVote {
+            term,
+            candidate_id,
+            last_log_index,
+            last_log_term,
+            reply_to,
         };
 
         let _ = self.tx.send(msg).await;
 
-        rx.await.unwrap_or(RequestVoteReply { 
-            term: 0, 
-            vote_granted: false 
+        rx.await.unwrap_or(RequestVoteReply {
+            term: 0,
+            vote_granted: false,
         })
     }
 
@@ -88,26 +84,26 @@ impl RaftService for RaftNodeHandle {
         leader_id: u64,
         prev_log_index: u64,
         prev_log_term: u64,
-        entries: Vec<LogEntry> ,
-        leader_commit: u64
+        entries: Vec<LogEntry>,
+        leader_commit: u64,
     ) -> AppendEntriesReply {
         let (reply_to, rx) = oneshot::channel();
 
-        let msg = ActorMsg::AppendEntries { 
-            term, 
-            leader_id, 
-            prev_log_index, 
-            prev_log_term, 
-            entries, 
-            leader_commit, 
-            reply_to 
+        let msg = ActorMsg::AppendEntries {
+            term,
+            leader_id,
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit,
+            reply_to,
         };
 
         let _ = self.tx.send(msg).await;
 
-        rx.await.unwrap_or(AppendEntriesReply { 
-            term: 0, 
-            success: false 
+        rx.await.unwrap_or(AppendEntriesReply {
+            term: 0,
+            success: false,
         })
     }
 
@@ -116,10 +112,10 @@ impl RaftService for RaftNodeHandle {
         _: context::Context,
         term: u64,
         leader_id: u64,
-        last_included_index : u64,
+        last_included_index: u64,
         last_included_term: u64,
         data: Vec<u8>,
-        done: bool
+        done: bool,
     ) -> InstallSnapshotReply {
         let (reply_to, rx) = oneshot::channel();
 
@@ -130,14 +126,14 @@ impl RaftService for RaftNodeHandle {
             last_included_term,
             data,
             done,
-            reply_to
+            reply_to,
         };
 
         let _ = self.tx.send(msg).await;
 
         rx.await.unwrap_or(InstallSnapshotReply {
             term: 0,
-            success: false
+            success: false,
         })
     }
 
@@ -169,26 +165,21 @@ impl RaftService for RaftNodeHandle {
             return Err(NodeError::Internal("Actor is dead".into()));
         }
 
-        rx.await.map_err(|_| NodeError::Internal("Actor did not reply".into()))?
+        rx.await
+            .map_err(|_| NodeError::Internal("Actor did not reply".into()))?
     }
 
-    async fn remove_membership(
-        self,
-        _: context::Context,
-        node_id: u64,
-    ) -> Result<(), NodeError> {
+    async fn remove_membership(self, _: context::Context, node_id: u64) -> Result<(), NodeError> {
         let (reply_to, rx) = oneshot::channel();
-    
-        let msg = ActorMsg::RemoveMembership {
-            node_id,
-            reply_to,
-        };
-    
+
+        let msg = ActorMsg::RemoveMembership { node_id, reply_to };
+
         if self.tx.send(msg).await.is_err() {
             return Err(NodeError::Internal("Actor is dead".into()));
         }
-    
-        rx.await.map_err(|_| NodeError::Internal("Actor did not reply".into()))?
+
+        rx.await
+            .map_err(|_| NodeError::Internal("Actor did not reply".into()))?
     }
 }
 
@@ -197,7 +188,7 @@ fn parse_peers(peers_str: &str) -> std::collections::HashMap<u64, String> {
     if peers_str.is_empty() {
         return peer_map;
     }
-    
+
     for s in peers_str.split(',') {
         if let Some((id_str, addr)) = s.split_once('=') {
             if let Ok(id) = id_str.parse::<u64>() {
@@ -225,7 +216,7 @@ async fn main() -> anyhow::Result<()> {
     let server_addr = SocketAddr::new(args.ip, args.port);
     let mut listener = tarpc::serde_transport::tcp::listen(server_addr, Json::default).await?;
     listener.config_mut().max_frame_length(usize::MAX);
-    
+
     let listener_tx = tx.clone();
     tokio::spawn(async move {
         tracing::info!("RPC Server listening on {}", server_addr);
@@ -233,14 +224,16 @@ async fn main() -> anyhow::Result<()> {
         while let Some(accept_result) = listener.next().await {
             match accept_result {
                 Ok(transport) => {
-                    let handle = RaftNodeHandle { tx: listener_tx.clone() };
+                    let handle = RaftNodeHandle {
+                        tx: listener_tx.clone(),
+                    };
                     tokio::spawn(async move {
                         server::BaseChannel::with_defaults(transport)
                             .execute(handle.serve())
                             .for_each(|response_future| async move {
                                 tokio::spawn(response_future);
                             })
-                            .await; 
+                            .await;
                     });
                 }
                 Err(e) => {
@@ -258,20 +251,19 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Peers Config: {:?}", peers_map);
     let mut rpc_clients = std::collections::HashMap::new();
     for (id, addr_str) in &peers_map {
-        if let Ok(addr) = addr_str.parse::<SocketAddr>() {
-            tracing::info!("Connecting to peer {} at {}...", id, addr);
-            if let Ok(transport) = tarpc::serde_transport::tcp::connect(addr, Json::default).await {
-                let client = RaftServiceClient::new(client::Config::default(), transport).spawn();
+        if *id == args.id {
+            continue;
+        }
+        match raft_core::utils::client::connect(addr_str).await {
+            Ok(client) => {
                 rpc_clients.insert(*id, client);
-                tracing::info!("Connected to peer {}", id);
-            } else {
-                tracing::warn!("Failed to connect to peer {} initially: {}", id, addr_str);
             }
+            Err(error) => tracing::warn!("Failed to connect to peer {} initially: {}", id, error),
         }
     }
 
     // --- 4. Create Actor and Bootstrap (in foreground) ---
-    let state = RaftState::new(args.id, peers_map.clone());
+    let state = RaftState::new_with_addr(args.id, peers_map.clone(), args.advertise_address);
     let mut actor = RaftActor::new(state, rx, tx, rpc_clients);
 
     if let Some(contact_node_address) = args.contact_node_address {
